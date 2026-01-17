@@ -16,6 +16,9 @@ frontend/dist/
 *.swp
 *.swo
 
+# Server launcher repo
+serverlauncher/
+
 # OS files
 .DS_Store
 Thumbs.db

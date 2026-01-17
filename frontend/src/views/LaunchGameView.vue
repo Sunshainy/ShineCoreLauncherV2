@@ -1,5 +1,5 @@
 <script lang="ts" setup>
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAppStore } from '@/stores/appStore'
 import { useAuthStore } from '@/stores/authStore'
@@ -25,9 +25,18 @@ const isLaunching = ref(false)
 const isInstalling = ref(false)
 const installProgress = ref(0)
 const gameInstalled = ref(false)
-const showProgress = ref(false)
-const progressPercent = ref(0)
-let progressTimer: number | null = null
+const isSyncing = ref(false)
+const syncProgress = ref(0)
+const showProgress = computed(() => isInstalling.value || isSyncing.value)
+const progressPercent = computed(() => {
+  const value = isSyncing.value ? syncProgress.value : installProgress.value
+  return Math.min(100, Math.max(0, Math.round(value)))
+})
+const progressLabel = computed(() => {
+  if (isSyncing.value) return 'Синхронизация модов...'
+  if (isInstalling.value) return 'Установка...'
+  return ''
+})
 
 // State enum
 const STATE = {
@@ -105,8 +114,6 @@ async function play() {
     notificationStore.showError('Введите ник')
     return
   }
-  startFakeProgress()
-
   // Check if game is installed
   try {
     const installed = await IsGameInstalled()
@@ -131,27 +138,6 @@ async function play() {
   } finally {
     isLaunching.value = false
   }
-}
-
-function startFakeProgress() {
-  if (progressTimer !== null) {
-    window.clearInterval(progressTimer)
-  }
-  showProgress.value = true
-  progressPercent.value = 0
-  progressTimer = window.setInterval(() => {
-    progressPercent.value = Math.min(progressPercent.value + 4, 100)
-    if (progressPercent.value >= 100) {
-      if (progressTimer !== null) {
-        window.clearInterval(progressTimer)
-        progressTimer = null
-      }
-      window.setTimeout(() => {
-        showProgress.value = false
-        progressPercent.value = 0
-      }, 600)
-    }
-  }, 120)
 }
 
 async function installGame() {
@@ -182,6 +168,7 @@ async function installGame() {
     isInstalling.value = false
   }
 }
+
 
 async function setProfile(uuid: string | number) {
   try {
@@ -218,6 +205,13 @@ onMounted(async () => {
     console.log('No saved player name found')
   }
 
+  // Load version from backend manifest
+  try {
+    await appStore.fetchGameVersion()
+  } catch (error) {
+    console.error('Failed to fetch game version:', error)
+  }
+
   // Check if game is installed
   try {
     gameInstalled.value = await IsGameInstalled()
@@ -227,8 +221,8 @@ onMounted(async () => {
 
   // Listen for installation progress events
   EventsOn('install:progress', (data: any) => {
-    if (data.progress) {
-      installProgress.value = Math.round(data.progress)
+    if (typeof data?.progress === 'number') {
+      installProgress.value = data.progress
     }
   })
 
@@ -236,15 +230,28 @@ onMounted(async () => {
     gameInstalled.value = true
   })
 
+  EventsOn('sync:progress', (data: any) => {
+    isSyncing.value = true
+    if (typeof data?.progress === 'number') {
+      syncProgress.value = data.progress
+    }
+  })
+
+  EventsOn('sync:complete', () => {
+    isSyncing.value = false
+    syncProgress.value = 0
+  })
+
+  EventsOn('sync:error', () => {
+    isSyncing.value = false
+    syncProgress.value = 0
+  })
+
   // TODO: Temporarily disabled
   // await appStore.fetchNewsFeed()
+
 })
 
-onBeforeUnmount(() => {
-  if (progressTimer !== null) {
-    window.clearInterval(progressTimer)
-  }
-})
 </script>
 
 <template>
@@ -294,10 +301,6 @@ onBeforeUnmount(() => {
         </HyButton>
         
         <!-- Installation progress -->
-        <div v-if="isInstalling" class="play-shinecore__install-progress">
-          <span class="play-shinecore__progress-text">{{ installProgress }}%</span>
-        </div>
-        
         <input
           v-model="playerNickname"
           type="text"
@@ -306,7 +309,7 @@ onBeforeUnmount(() => {
           :disabled="isInstalling"
         />
         <span class="play-shinecore__version-text shinecore-version">
-          Version: latest
+          Version: {{ installedVersionText }}
         </span>
       </div>
 
@@ -319,6 +322,7 @@ onBeforeUnmount(() => {
 
       <div v-if="showProgress" class="launch-game__progress">
         <div class="launch-game__progress-info">
+          <span class="launch-game__progress-label">{{ progressLabel }}</span>
           <span class="launch-game__progress-percent">{{ progressPercent }}%</span>
         </div>
         <div class="launch-game__progress-bar">
@@ -408,6 +412,12 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: flex-start;
   align-items: center;
+  gap: 8px;
+}
+
+.launch-game__progress-label {
+  color: rgba(210, 217, 226, 0.7);
+  font-size: 12px;
 }
 
 .launch-game__progress-percent {
@@ -437,6 +447,7 @@ onBeforeUnmount(() => {
   animation: progress-scroll 6s linear infinite;
 }
 
+
 @keyframes progress-scroll {
   0% {
     background-position: -100% center;
@@ -445,6 +456,7 @@ onBeforeUnmount(() => {
     background-position: 100% center;
   }
 }
+
 
 .launch-game__logo :deep(img) {
   height: 146px;
@@ -519,17 +531,6 @@ onBeforeUnmount(() => {
   color: rgba(210, 217, 226, 0.4);
 }
 
-.play-shinecore__install-progress {
-  margin-top: 12px;
-  margin-bottom: 12px;
-  text-align: center;
-}
-
-.play-shinecore__progress-text {
-  color: rgba(210, 217, 226, 0.9);
-  font-size: 16px;
-  font-weight: 600;
-}
 
 .shinecore-version {
   color: rgba(210, 217, 226, 0.5);

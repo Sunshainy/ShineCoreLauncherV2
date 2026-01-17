@@ -53,7 +53,8 @@ const bgStyle = `url(${curseBg})`
   left: 0;
   top: 0;
   bottom: 0;
-  opacity: 1;
+  opacity: 0.6;
+  filter: blur(0.6px) brightness(0.95) saturate(0.9);
   object-fit: contain;
 }
 
