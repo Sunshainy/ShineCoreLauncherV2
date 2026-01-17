@@ -11,7 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 
 	"shinecore/internal/launcher/download"
 	"shinecore/internal/launcher/mojang"
@@ -315,8 +317,19 @@ func runProcessors(ctx context.Context, javaPath, librariesDir string, profile *
 				args = append(args, formatted)
 			}
 		}
-		cmd := exec.CommandContext(ctx, javaPath, args...)
+		path := javaPath
+		if runtime.GOOS == "windows" {
+			path = strings.ReplaceAll(path, "java.exe", "javaw.exe")
+			path = strings.ReplaceAll(path, "\\bin\\java.exe", "\\bin\\javaw.exe")
+		}
+		cmd := exec.CommandContext(ctx, path, args...)
 		cmd.Dir = librariesDir
+		if runtime.GOOS == "windows" {
+			cmd.SysProcAttr = &syscall.SysProcAttr{
+				HideWindow:    true,
+				CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+			}
+		}
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("processor failed: %s: %w", string(out), err)

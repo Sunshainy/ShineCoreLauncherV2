@@ -11,9 +11,11 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"shinecore/internal/launcher/archive"
@@ -56,13 +58,42 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 	client := &http.Client{}
 	srv := &server.Client{BaseURL: serverCfg.ServerBaseURL, Secret: serverCfg.ServerSecret, Client: client}
 	slog.Info("launcher: fetch manifest", "server", serverCfg.ServerBaseURL)
+	
+	// Сохраняем старые значения перед применением манифеста
+	oldGameVersion := cfg.GameVersion
+	oldLoader := cfg.Loader
+	
 	manifest, err := srv.FetchManifest(ctx)
 	if err != nil {
-		slog.Error("launcher: manifest failed", "error", err)
-		return nil, err
+		// Fallback: Если манифест недоступен - используем сохранённый конфиг
+		if strings.TrimSpace(cfg.GameVersion) == "" {
+			slog.Error("launcher: manifest unavailable and config incomplete", "error", err)
+			return nil, errors.New("manifest unavailable and config incomplete: " + err.Error())
+		}
+		// Используем сохранённый конфиг для продолжения установки/запуска
+		slog.Info("launcher: manifest unavailable, using saved config", 
+			"version", cfg.GameVersion, "loader", cfg.Loader, 
+			"note", "server offline or manifest cache missing - using local config")
+		manifest = nil // Явно указываем, что манифеста нет
+	} else {
+		slog.Info("launcher: manifest fetched", "mods", len(manifest.Packages.Mods))
+		applyManifest(cfg, manifest)
 	}
-	slog.Info("launcher: manifest fetched", "mods", len(manifest.Packages.Mods))
-	applyManifest(cfg, manifest)
+	
+	// Проверяем, изменились ли версия игры или загрузчик
+	versionChanged := oldGameVersion != "" && oldGameVersion != cfg.GameVersion
+	loaderChanged := oldLoader != cfg.Loader
+	
+	if versionChanged || loaderChanged {
+		slog.Info("launcher: version or loader changed", 
+			"old_version", oldGameVersion, "new_version", cfg.GameVersion,
+			"old_loader", oldLoader, "new_loader", cfg.Loader)
+		if err := cleanInstallDir(cfg.InstallDir); err != nil {
+			slog.Error("launcher: clean install dir failed", "error", err)
+			return nil, err
+		}
+	}
+	
 	if err := cfg.Save(l.ConfigPath); err != nil {
 		slog.Error("launcher: save config failed", "error", err)
 		return nil, err
@@ -75,17 +106,32 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 
 	tracker := newProgressTracker(onProgress)
 
-	if err := syncModsStrict(ctx, client, srv, cfg.InstallDir, manifest, tracker); err != nil {
-		slog.Error("launcher: sync packages failed", "error", err)
-		return nil, err
+	// Синхронизация модов только если манифест доступен
+	if manifest != nil {
+		if err := syncModsStrict(ctx, client, srv, cfg.InstallDir, manifest, tracker); err != nil {
+			slog.Error("launcher: sync packages failed", "error", err)
+			return nil, err
+		}
+	} else {
+		slog.Info("launcher: skipping mods sync (manifest unavailable)")
 	}
 
 	requiredJava := resolveRequiredJava(manifest, cfg.GameVersion)
-	javaPath, err := ensureJava(ctx, client, srv, cfg.InstallDir, manifest, requiredJava)
-	if err != nil {
-		slog.Error("launcher: ensure java failed", "error", err)
-		return nil, err
+	
+	// Сначала проверяем локально установленную Java
+	javaPath := findInstalledJava(cfg.InstallDir, requiredJava)
+	
+	// Если Java не найдена локально и манифест доступен - пытаемся загрузить
+	if javaPath == "" && manifest != nil {
+		var err error
+		javaPath, err = ensureJava(ctx, client, srv, cfg.InstallDir, manifest, requiredJava)
+		if err != nil {
+			slog.Warn("launcher: ensure java failed", "error", err)
+			// Не блокируем установку, если Java можно будет найти позже
+		}
 	}
+	
+	// Повторная проверка локальной Java на случай, если ensureJava не сработал
 	if javaPath == "" {
 		javaPath = findInstalledJava(cfg.InstallDir, requiredJava)
 	}
@@ -203,16 +249,19 @@ func (l *Launcher) Launch(ctx context.Context, playerName string) error {
 	}
 
 	requiredJava := resolveRequiredJava(nil, cfg.GameVersion)
+	slog.Info("launcher: checking java", "required", requiredJava, "install_dir", cfg.InstallDir)
 	javaPath := findInstalledJava(cfg.InstallDir, requiredJava)
 	if javaPath == "" {
+		slog.Error("launcher: java not found", "required", requiredJava, "search_dir", javaVersionDir(cfg.InstallDir, requiredJava))
 		if requiredJava > 0 {
 			return errors.New("java не установлена: нужна версия " + strconv.Itoa(requiredJava))
 		}
 		return errors.New("java не установлена (runtime not found)")
 	}
+	slog.Info("launcher: java found", "path", javaPath, "version", requiredJava)
 
 	versionID := resolveVersionID(cfg)
-	slog.Info("launcher: launching", "version", versionID, "memory_mb", cfg.MemoryMB)
+	slog.Info("launcher: launching", "version", versionID, "memory_mb", cfg.MemoryMB, "java", javaPath)
 	return launch.Launch(ctx, launch.LaunchRequest{
 		BaseDir:  cfg.InstallDir,
 		Version:  versionID,
@@ -236,7 +285,10 @@ func (l *Launcher) SyncMods(ctx context.Context, onProgress func(ProgressEvent))
 	slog.Info("launcher: sync mods start", "server", serverCfg.ServerBaseURL)
 	manifest, err := srv.FetchManifest(ctx)
 	if err != nil {
-		return err
+		// Если манифест недоступен - просто пропускаем синхронизацию модов
+		// Это не критично, игра может работать с уже установленными модами
+		slog.Info("launcher: sync mods skipped - manifest unavailable", "error", err)
+		return nil
 	}
 	slog.Info("launcher: manifest fetched for sync", "mods", len(manifest.Packages.Mods))
 	tracker := newProgressTracker(onProgress)
@@ -471,6 +523,7 @@ func findInstalledJava(baseDir string, required int) string {
 	root := javaBaseDir(baseDir)
 	if required > 0 {
 		targetDir := javaVersionDir(baseDir, required)
+		slog.Debug("launcher: searching java", "dir", targetDir, "required", required)
 		if path := findJavaInDirTree(targetDir, required); path != "" {
 			return path
 		}
@@ -499,14 +552,16 @@ func findJavaInDirTree(dir string, required int) string {
 	if path := findJavaInDirWithMajor(dir, required); path != "" {
 		return path
 	}
-	var found string
-	errFound := errors.New("java found")
+	var foundJavaW string
+	var foundJava string
 	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
 		name := strings.ToLower(d.Name())
-		if name != "javaw.exe" && name != "java.exe" {
+		isJavaW := name == "javaw.exe"
+		isJava := name == "java.exe"
+		if !isJavaW && !isJava {
 			return nil
 		}
 		if strings.ToLower(filepath.Base(filepath.Dir(path))) != "bin" {
@@ -518,11 +573,18 @@ func findJavaInDirTree(dir string, required int) string {
 				return nil
 			}
 		}
-		found = path
-		return errFound
+		if isJavaW {
+			foundJavaW = path
+		} else if foundJava == "" {
+			foundJava = path
+		}
+		return nil
 	})
-	if found != "" {
-		return found
+	if foundJavaW != "" {
+		return foundJavaW
+	}
+	if foundJava != "" {
+		return foundJava
 	}
 	return ""
 }
@@ -613,26 +675,70 @@ func resolveVersionID(cfg *config.Config) string {
 	return cfg.GameVersion
 }
 
+func cleanInstallDir(baseDir string) error {
+	if strings.TrimSpace(baseDir) == "" {
+		return errors.New("install dir is empty")
+	}
+	
+	// Папки и файлы, которые нужно удалить
+	itemsToRemove := []string{
+		"versions",
+		"libraries",
+		"mods",
+		"assets",
+		"bin",
+		"logs",
+		"saves",
+		"resourcepacks",
+		"shaderpacks",
+		"config",
+		"screenshots",
+		"options.txt",
+		"optionsof.txt",
+		"usercache.json",
+		"usernamecache.json",
+	}
+	
+	javaDir := filepath.Join(baseDir, "java")
+	
+	for _, item := range itemsToRemove {
+		path := filepath.Join(baseDir, item)
+		if err := os.RemoveAll(path); err != nil {
+			slog.Warn("launcher: failed to remove item", "path", path, "error", err)
+		}
+	}
+	
+	// Убеждаемся, что папка java осталась
+	if err := os.MkdirAll(javaDir, 0o755); err != nil {
+		return err
+	}
+	
+	slog.Info("launcher: install dir cleaned", "base_dir", baseDir)
+	return nil
+}
+
 func runJavaInstaller(ctx context.Context, installerPath string) error {
 	ext := strings.ToLower(filepath.Ext(installerPath))
+	var cmd *exec.Cmd
 	switch ext {
 	case ".msi":
-		cmd := exec.CommandContext(ctx, "msiexec", "/i", installerPath, "/qn", "/norestart")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return errors.New("java installer failed: " + string(output))
-		}
-		return nil
+		cmd = exec.CommandContext(ctx, "msiexec", "/i", installerPath, "/qn", "/norestart")
 	case ".exe":
-		cmd := exec.CommandContext(ctx, installerPath, "/qn", "/norestart")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return errors.New("java installer failed: " + string(output))
-		}
-		return nil
+		cmd = exec.CommandContext(ctx, installerPath, "/qn", "/norestart")
 	default:
 		return errors.New("unsupported java installer: " + ext)
 	}
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		}
+	}
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.New("java installer failed: " + string(output))
+	}
+	return nil
 }
 
 func modKey(path string) string {

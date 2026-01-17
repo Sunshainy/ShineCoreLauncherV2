@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"shinecore/internal/logging"
 	"shinecore/internal/launcher/mojang"
@@ -51,11 +52,23 @@ func Launch(ctx context.Context, req LaunchRequest) error {
 	}
 
 	args := buildArgs(req, resolved, nativesDir)
-	slog.Info("launcher: java start", "java", req.JavaPath, "args_count", len(args))
-	cmd := exec.CommandContext(ctx, req.JavaPath, args...)
+	javaPath := req.JavaPath
+	if runtime.GOOS == "windows" {
+		// На Windows всегда используем javaw.exe вместо java.exe для скрытия консоли
+		javaPath = strings.ReplaceAll(javaPath, "java.exe", "javaw.exe")
+		javaPath = strings.ReplaceAll(javaPath, "\\bin\\java.exe", "\\bin\\javaw.exe")
+	}
+	slog.Info("launcher: java start", "java", javaPath, "args_count", len(args))
+	cmd := exec.CommandContext(ctx, javaPath, args...)
 	cmd.Dir = req.BaseDir
 	cmd.Stdout = logging.Writer()
 	cmd.Stderr = logging.Writer()
+	if runtime.GOOS == "windows" {
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			HideWindow:    true,
+			CreationFlags: 0x08000000, // CREATE_NO_WINDOW
+		}
+	}
 	return cmd.Start()
 }
 

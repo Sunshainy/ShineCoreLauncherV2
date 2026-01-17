@@ -7,9 +7,12 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -25,18 +28,75 @@ func (c *Client) FetchManifest(ctx context.Context) (*Manifest, error) {
 	base := strings.TrimRight(c.BaseURL, "/")
 	req, err := c.SignedRequest(ctx, http.MethodGet, base+"/manifest")
 	if err != nil {
-		return nil, err
+		return c.loadCachedManifest()
 	}
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
+		// Пытаемся загрузить из кэша при ошибке подключения
+		if cached, cacheErr := c.loadCachedManifest(); cacheErr == nil {
+			return cached, nil
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, errors.New("manifest request failed: " + resp.Status)
+		// Пытаемся загрузить из кэша при ошибке сервера
+		if cached, cacheErr := c.loadCachedManifest(); cacheErr == nil {
+			// Кэш загружен успешно - возвращаем без ошибки
+			return cached, nil
+		}
+		// Кэш недоступен - возвращаем ошибку (будет использован fallback на конфиг в launcher.go)
+		return nil, errors.New("manifest unavailable: server error " + resp.Status)
+	}
+	
+	// Читаем ответ
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return c.loadCachedManifest()
+	}
+	
+	var manifest Manifest
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return c.loadCachedManifest()
+	}
+	
+	// Сохраняем манифест в кэш при успешной загрузке
+	_ = c.saveCachedManifest(body)
+	
+	return &manifest, nil
+}
+
+func (c *Client) manifestCachePath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	cacheDir := filepath.Join(configDir, "shinecore")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "manifest_cache.json"), nil
+}
+
+func (c *Client) saveCachedManifest(data []byte) error {
+	path, err := c.manifestCachePath()
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o644)
+}
+
+func (c *Client) loadCachedManifest() (*Manifest, error) {
+	path, err := c.manifestCachePath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
 	var manifest Manifest
-	if err := json.NewDecoder(resp.Body).Decode(&manifest); err != nil {
+	if err := json.Unmarshal(data, &manifest); err != nil {
 		return nil, err
 	}
 	return &manifest, nil
