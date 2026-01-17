@@ -11,6 +11,7 @@ import (
 const (
 	defaultInstallDirName = "shinecore"
 	configFileName        = "launcher.json"
+	defaultServerBaseURL  = "https://api.be-sunshainy.ru"
 )
 
 type Config struct {
@@ -19,8 +20,7 @@ type Config struct {
 	Loader        string `json:"loader"`         // fabric|forge|neoforge
 	LoaderVersion string `json:"loader_version"` // optional for latest
 
-	JavaPackage string `json:"java_package"`
-	MemoryMB    int    `json:"memory_mb"`
+	MemoryMB       int  `json:"memory_mb"`
 	ConsoleEnabled bool `json:"console_enabled"`
 }
 
@@ -136,7 +136,7 @@ func LoadServer(path string) (*ServerConfig, error) {
 		}
 	}
 	cfg := &ServerConfig{
-		ServerBaseURL: "https://api.be-sunshainy.ru",
+		ServerBaseURL: defaultServerBaseURL,
 		ServerSecret:  "sun",
 	}
 	data, err := os.ReadFile(path)
@@ -149,8 +149,9 @@ func LoadServer(path string) (*ServerConfig, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
 	}
+	cfg.ServerBaseURL = normalizeServerBaseURL(cfg.ServerBaseURL)
 	if strings.TrimSpace(cfg.ServerBaseURL) == "" {
-		cfg.ServerBaseURL = "https://api.be-sunshainy.ru"
+		cfg.ServerBaseURL = defaultServerBaseURL
 	}
 	return cfg, nil
 }
@@ -171,6 +172,17 @@ func (c *ServerConfig) Save(path string) error {
 		return err
 	}
 	return os.WriteFile(path, payload, 0o600)
+}
+
+func normalizeServerBaseURL(raw string) string {
+	base := strings.TrimSpace(raw)
+	if base == "" {
+		return ""
+	}
+	if strings.HasPrefix(base, "http://") || strings.HasPrefix(base, "https://") {
+		return base
+	}
+	return "https://" + base
 }
 
 type Profile struct {

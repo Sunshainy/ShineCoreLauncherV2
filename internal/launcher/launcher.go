@@ -5,14 +5,18 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"shinecore/internal/launcher/archive"
 	"shinecore/internal/launcher/config"
 	"shinecore/internal/launcher/download"
 	"shinecore/internal/launcher/fabric"
@@ -33,6 +37,8 @@ type ProgressEvent struct {
 type Launcher struct {
 	ConfigPath string
 }
+
+var mcVersionRe = regexp.MustCompile(`^1\.(\d+)(?:\.(\d+))?`)
 
 func (l *Launcher) LoadConfig() (*config.Config, error) {
 	return config.Load(l.ConfigPath)
@@ -55,7 +61,7 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 		slog.Error("launcher: manifest failed", "error", err)
 		return nil, err
 	}
-	slog.Info("launcher: manifest fetched", "mods", len(manifest.Packages.Mods), "javas", len(manifest.Packages.Javas))
+	slog.Info("launcher: manifest fetched", "mods", len(manifest.Packages.Mods))
 	applyManifest(cfg, manifest)
 	if err := cfg.Save(l.ConfigPath); err != nil {
 		slog.Error("launcher: save config failed", "error", err)
@@ -74,19 +80,20 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 		return nil, err
 	}
 
-	javaPath, err := ensureJava(ctx, client, srv, cfg.InstallDir, manifest, cfg.JavaPackage)
+	requiredJava := resolveRequiredJava(manifest, cfg.GameVersion)
+	javaPath, err := ensureJava(ctx, client, srv, cfg.InstallDir, manifest, requiredJava)
 	if err != nil {
 		slog.Error("launcher: ensure java failed", "error", err)
 		return nil, err
 	}
 	if javaPath == "" {
-		javaPath = findInstalledJava(cfg.InstallDir, cfg.JavaPackage)
+		javaPath = findInstalledJava(cfg.InstallDir, requiredJava)
 	}
 
 	_, err = mojang.EnsureInstalled(ctx, mojang.InstallRequest{
-		BaseDir: cfg.InstallDir,
-		Version: cfg.GameVersion,
-		Client:  client,
+		BaseDir:      cfg.InstallDir,
+		Version:      cfg.GameVersion,
+		Client:       client,
 		AssetWorkers: 16,
 		OnProgress: func(step string, done, total int) {
 			tracker.Update(step, done, total)
@@ -195,17 +202,21 @@ func (l *Launcher) Launch(ctx context.Context, playerName string) error {
 		_ = profile.Save("")
 	}
 
-	javaPath := findInstalledJava(cfg.InstallDir, cfg.JavaPackage)
+	requiredJava := resolveRequiredJava(nil, cfg.GameVersion)
+	javaPath := findInstalledJava(cfg.InstallDir, requiredJava)
 	if javaPath == "" {
+		if requiredJava > 0 {
+			return errors.New("java не установлена: нужна версия " + strconv.Itoa(requiredJava))
+		}
 		return errors.New("java не установлена (runtime not found)")
 	}
 
 	versionID := resolveVersionID(cfg)
 	slog.Info("launcher: launching", "version", versionID, "memory_mb", cfg.MemoryMB)
 	return launch.Launch(ctx, launch.LaunchRequest{
-		BaseDir: cfg.InstallDir,
-		Version: versionID,
-		Player:  launch.PlayerInfo{Name: playerName, UUID: playerUUID},
+		BaseDir:  cfg.InstallDir,
+		Version:  versionID,
+		Player:   launch.PlayerInfo{Name: playerName, UUID: playerUUID},
 		JavaPath: javaPath,
 		MemoryMB: cfg.MemoryMB,
 	})
@@ -268,9 +279,6 @@ func applyManifest(cfg *config.Config, manifest *server.Manifest) {
 		if manifest.Dependencies.LoaderVersion != "" {
 			cfg.LoaderVersion = manifest.Dependencies.LoaderVersion
 		}
-	}
-	if manifest.Dependencies.JavaPackage != "" {
-		cfg.JavaPackage = manifest.Dependencies.JavaPackage
 	}
 }
 
@@ -356,111 +364,165 @@ func syncModsStrict(ctx context.Context, client *http.Client, srv *server.Client
 	return nil
 }
 
-func ensureJava(ctx context.Context, client *http.Client, srv *server.Client, baseDir string, manifest *server.Manifest, desired string) (string, error) {
+func ensureJava(ctx context.Context, client *http.Client, srv *server.Client, baseDir string, manifest *server.Manifest, required int) (string, error) {
+	if required <= 0 {
+		return "", errors.New("java version not resolved")
+	}
+	if path := findInstalledJava(baseDir, required); path != "" {
+		return path, nil
+	}
+
 	if manifest == nil {
-		return "", nil
+		return "", errors.New("java url not provided: need Java " + strconv.Itoa(required))
+	}
+	downloadURL := javaURLForVersion(manifest.Dependencies.JavaURLs, required)
+	if strings.TrimSpace(downloadURL) == "" {
+		return "", errors.New("java url not set: need Java " + strconv.Itoa(required))
 	}
 
-	required := manifest.Dependencies.JavaVersion
-	systemPath := java.FindSystemJava()
-	if systemPath != "" {
-		if required <= 0 {
-			return systemPath, nil
-		}
-		if major, err := java.GetJavaMajor(systemPath); err == nil {
-			if major == required {
-				return systemPath, nil
-			}
-		}
+	downloadDir := filepath.Join(javaBaseDir(baseDir), "downloads")
+	if err := os.MkdirAll(downloadDir, 0o755); err != nil {
+		return "", err
 	}
+	archiveName := javaArchiveName(downloadURL, required)
+	dst := filepath.Join(downloadDir, archiveName)
 
-	if required <= 0 && len(manifest.Packages.Javas) == 0 {
-		return "", nil
-	}
-
-	if len(manifest.Packages.Javas) == 0 {
-		if systemPath != "" && required > 0 {
-			return "", errors.New("java version mismatch: need " + strconv.Itoa(required))
-		}
-		return "", errors.New("java not found: install Java " + strconv.Itoa(required))
-	}
-
-	pkg := pickJavaPackage(manifest.Packages.Javas, desired)
-	if pkg == nil {
-		return "", errors.New("java package not found")
-	}
-	downloadURL := srv.ResolveURL(pkg.URL)
-	req, err := srv.SignedRequest(ctx, http.MethodGet, downloadURL)
+	req, err := buildJavaDownloadRequest(ctx, srv, downloadURL)
 	if err != nil {
 		return "", err
 	}
-	installerDir := filepath.Join(baseDir, "java", "installer")
-	if err := os.MkdirAll(installerDir, 0o755); err != nil {
+	if err := download.EnsureFileWithRequest(ctx, client, req, dst, 0, "", nil); err != nil {
 		return "", err
 	}
-	dst := filepath.Join(installerDir, pkg.Name)
-	if pkg.Name == "" {
-		dst = filepath.Join(installerDir, filepath.Base(pkg.Path))
+
+	ext := strings.ToLower(filepath.Ext(archiveName))
+	switch ext {
+	case ".zip":
+		targetDir := javaVersionDir(baseDir, required)
+		_ = os.RemoveAll(targetDir)
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
+			return "", err
+		}
+		if err := archive.ExtractZip(dst, targetDir); err != nil {
+			return "", err
+		}
+		if path := findJavaInDirTree(targetDir, required); path != "" {
+			return path, nil
+		}
+		return "", errors.New("java not found after extract: need Java " + strconv.Itoa(required))
+	case ".msi", ".exe":
+		if err := runJavaInstaller(ctx, dst); err != nil {
+			return "", err
+		}
+		if path := findInstalledJava(baseDir, required); path != "" {
+			return path, nil
+		}
+		return "", errors.New("java installed but not found in local runtime: provide zip for Java " + strconv.Itoa(required))
+	default:
+		return "", errors.New("unsupported java package: " + ext)
 	}
-	if err := download.EnsureFileWithRequest(ctx, client, req, dst, pkg.Size, pkg.Sha256, nil); err != nil {
-		return "", err
+}
+
+func javaBaseDir(baseDir string) string {
+	return filepath.Join(baseDir, "java")
+}
+
+func javaVersionDir(baseDir string, required int) string {
+	return filepath.Join(javaBaseDir(baseDir), "java"+strconv.Itoa(required))
+}
+
+func javaArchiveName(raw string, required int) string {
+	name := ""
+	if parsed, err := url.Parse(raw); err == nil {
+		name = path.Base(parsed.Path)
 	}
-	if err := runJavaInstaller(ctx, dst); err != nil {
-		return "", err
+	if name == "" || name == "." || name == "/" {
+		return "java" + strconv.Itoa(required) + ".zip"
 	}
-	systemPath = java.FindSystemJava()
-	if systemPath == "" {
-		return "", errors.New("java not found after install: install Java " + strconv.Itoa(required))
+	return name
+}
+
+func javaURLForVersion(urls server.JavaURLs, required int) string {
+	switch required {
+	case 8:
+		return urls.Java8
+	case 17:
+		return urls.Java17
+	case 21:
+		return urls.Java21
+	default:
+		return ""
 	}
+}
+
+func buildJavaDownloadRequest(ctx context.Context, srv *server.Client, raw string) (*http.Request, error) {
+	trimmed := strings.TrimSpace(raw)
+	if strings.HasPrefix(trimmed, "http://") || strings.HasPrefix(trimmed, "https://") {
+		return http.NewRequestWithContext(ctx, http.MethodGet, trimmed, nil)
+	}
+	if srv != nil {
+		resolved := srv.ResolveURL(trimmed)
+		return srv.SignedRequest(ctx, http.MethodGet, resolved)
+	}
+	return http.NewRequestWithContext(ctx, http.MethodGet, trimmed, nil)
+}
+
+func findInstalledJava(baseDir string, required int) string {
+	root := javaBaseDir(baseDir)
 	if required > 0 {
-		if major, err := java.GetJavaMajor(systemPath); err == nil && major != required {
-			return "", errors.New("java version mismatch: need " + strconv.Itoa(required))
-		}
-	}
-	return systemPath, nil
-}
-
-func pickJavaPackage(list []server.FilePackage, desired string) *server.FilePackage {
-	if desired != "" {
-		for i := range list {
-			if list[i].Name == desired || filepath.Base(list[i].Path) == desired {
-				return &list[i]
-			}
-		}
-	}
-	if len(list) > 0 {
-		return &list[0]
-	}
-	return nil
-}
-
-func findInstalledJava(baseDir, desired string) string {
-	if desired != "" {
-		dir := filepath.Join(baseDir, "runtime", "java", strings.TrimSuffix(filepath.Base(desired), filepath.Ext(desired)))
-		if path := findJavaInDir(dir); path != "" {
+		targetDir := javaVersionDir(baseDir, required)
+		if path := findJavaInDirTree(targetDir, required); path != "" {
 			return path
 		}
+		return ""
 	}
-	root := filepath.Join(baseDir, "runtime", "java")
 	entries, err := os.ReadDir(root)
 	if err != nil {
-		// Fall back to system Java.
-		if path := java.FindSystemJava(); path != "" {
-			return path
-		}
 		return ""
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
 			continue
 		}
-		path := findJavaInDir(filepath.Join(root, entry.Name()))
+		path := findJavaInDirTree(filepath.Join(root, entry.Name()), required)
 		if path != "" {
 			return path
 		}
 	}
-	if path := findSystemJava(); path != "" {
+	return ""
+}
+
+func findJavaInDirTree(dir string, required int) string {
+	if dir == "" {
+		return ""
+	}
+	if path := findJavaInDirWithMajor(dir, required); path != "" {
 		return path
+	}
+	var found string
+	errFound := errors.New("java found")
+	_ = filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := strings.ToLower(d.Name())
+		if name != "javaw.exe" && name != "java.exe" {
+			return nil
+		}
+		if strings.ToLower(filepath.Base(filepath.Dir(path))) != "bin" {
+			return nil
+		}
+		if required > 0 {
+			major, err := java.GetJavaMajor(path)
+			if err != nil || major != required {
+				return nil
+			}
+		}
+		found = path
+		return errFound
+	})
+	if found != "" {
+		return found
 	}
 	return ""
 }
@@ -477,8 +539,61 @@ func findJavaInDir(dir string) string {
 	return ""
 }
 
-func findSystemJava() string {
-	return java.FindSystemJava()
+func findJavaInDirWithMajor(dir string, required int) string {
+	if required <= 0 {
+		return findJavaInDir(dir)
+	}
+	path := findJavaInDir(dir)
+	if path == "" {
+		return ""
+	}
+	major, err := java.GetJavaMajor(path)
+	if err != nil || major != required {
+		return ""
+	}
+	return path
+}
+
+func resolveRequiredJava(manifest *server.Manifest, gameVersion string) int {
+	version := strings.TrimSpace(gameVersion)
+	if manifest != nil && strings.TrimSpace(manifest.Dependencies.GameVersion) != "" {
+		version = manifest.Dependencies.GameVersion
+	}
+	if required, ok := javaRequiredForMinecraft(version); ok {
+		return required
+	}
+	return 0
+}
+
+func javaRequiredForMinecraft(version string) (int, bool) {
+	match := mcVersionRe.FindStringSubmatch(strings.TrimSpace(version))
+	if len(match) < 2 {
+		return 0, false
+	}
+	minor, err := strconv.Atoi(match[1])
+	if err != nil {
+		return 0, false
+	}
+	patch := 0
+	if len(match) > 2 && match[2] != "" {
+		if patch, err = strconv.Atoi(match[2]); err != nil {
+			return 0, false
+		}
+	}
+	switch {
+	case minor <= 16:
+		return 8, true
+	case minor == 17:
+		return 16, true
+	case minor > 20:
+		return 21, true
+	case minor == 20 && patch >= 5:
+		return 21, true
+	case minor >= 18:
+		return 17, true
+	default:
+		return 0, false
+	}
 }
 
 func resolveVersionID(cfg *config.Config) string {
