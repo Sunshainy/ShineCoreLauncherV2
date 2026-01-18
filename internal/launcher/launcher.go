@@ -3,6 +3,7 @@ package launcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -55,13 +56,14 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 	if err != nil {
 		return nil, err
 	}
-	client := &http.Client{}
+	client := newHTTPClient()
 	srv := &server.Client{BaseURL: serverCfg.ServerBaseURL, Secret: serverCfg.ServerSecret, Client: client}
 	slog.Info("launcher: fetch manifest", "server", serverCfg.ServerBaseURL)
 	
 	// Сохраняем старые значения перед применением манифеста
 	oldGameVersion := cfg.GameVersion
 	oldLoader := cfg.Loader
+	oldLoaderVersion := cfg.LoaderVersion
 	
 	manifest, err := srv.FetchManifest(ctx)
 	if err != nil {
@@ -83,15 +85,23 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 	// Проверяем, изменились ли версия игры или загрузчик
 	versionChanged := oldGameVersion != "" && oldGameVersion != cfg.GameVersion
 	loaderChanged := oldLoader != cfg.Loader
+	loaderVersionChanged := oldLoaderVersion != cfg.LoaderVersion
 	
-	if versionChanged || loaderChanged {
-		slog.Info("launcher: version or loader changed", 
+	// ГАРАНТИРОВАННАЯ очистка при смене загрузчика ДО загрузки
+	if versionChanged || loaderChanged || loaderVersionChanged {
+		slog.Info("launcher: version or loader changed - cleaning install dir BEFORE installation", 
 			"old_version", oldGameVersion, "new_version", cfg.GameVersion,
-			"old_loader", oldLoader, "new_loader", cfg.Loader)
+			"old_loader", oldLoader, "new_loader", cfg.Loader,
+			"old_loader_version", oldLoaderVersion, "new_loader_version", cfg.LoaderVersion)
+		
+		// Принудительная очистка - удаляем всё кроме java и файлов лаунчера
 		if err := cleanInstallDir(cfg.InstallDir); err != nil {
 			slog.Error("launcher: clean install dir failed", "error", err)
-			return nil, err
+			return nil, fmt.Errorf("cleanup failed: %w", err)
 		}
+		
+		// Убеждаемся, что очистка завершена перед загрузкой
+		slog.Info("launcher: install dir cleaned successfully, proceeding with installation")
 	}
 	
 	if err := cfg.Save(l.ConfigPath); err != nil {
@@ -225,6 +235,84 @@ func (l *Launcher) Install(ctx context.Context, onProgress func(ProgressEvent)) 
 	return cfg, nil
 }
 
+func (l *Launcher) PrepareForLaunch(ctx context.Context, onProgress func(ProgressEvent)) error {
+	cfg, err := l.LoadConfig()
+	if err != nil {
+		return err
+	}
+	serverCfg, err := config.LoadServer("")
+	if err != nil {
+		return err
+	}
+	client := newHTTPClient()
+	srv := &server.Client{BaseURL: serverCfg.ServerBaseURL, Secret: serverCfg.ServerSecret, Client: client}
+	tracker := newProgressTracker(onProgress)
+
+	oldGameVersion := cfg.GameVersion
+	oldLoader := cfg.Loader
+	oldLoaderVersion := cfg.LoaderVersion
+
+	manifest, err := srv.FetchManifest(ctx)
+	if err != nil {
+		if strings.TrimSpace(cfg.GameVersion) == "" {
+			slog.Error("launcher: manifest unavailable and config incomplete", "error", err)
+			return errors.New("manifest unavailable and config incomplete: " + err.Error())
+		}
+		slog.Info("launcher: manifest unavailable, using saved config",
+			"version", cfg.GameVersion, "loader", cfg.Loader,
+			"note", "server offline or manifest cache missing - using local config")
+		manifest = nil
+	} else {
+		slog.Info("launcher: manifest fetched", "mods", len(manifest.Packages.Mods))
+		applyManifest(cfg, manifest)
+	}
+
+	versionChanged := oldGameVersion != "" && oldGameVersion != cfg.GameVersion
+	loaderChanged := oldLoader != cfg.Loader
+	loaderVersionChanged := oldLoaderVersion != cfg.LoaderVersion
+	if versionChanged || loaderChanged || loaderVersionChanged {
+		slog.Info("launcher: version or loader changed - full install required",
+			"old_version", oldGameVersion, "new_version", cfg.GameVersion,
+			"old_loader", oldLoader, "new_loader", cfg.Loader,
+			"old_loader_version", oldLoaderVersion, "new_loader_version", cfg.LoaderVersion)
+		_, err := l.Install(ctx, onProgress)
+		return err
+	}
+
+	if err := cfg.Save(l.ConfigPath); err != nil {
+		return err
+	}
+
+	installed, err := l.IsInstalled()
+	if err != nil {
+		return err
+	}
+	if !installed {
+		_, err := l.Install(ctx, onProgress)
+		return err
+	}
+
+	if manifest != nil {
+		if err := syncModsStrict(ctx, client, srv, cfg.InstallDir, manifest, tracker); err != nil {
+			return err
+		}
+	} else {
+		slog.Info("launcher: skipping mods sync (manifest unavailable)")
+	}
+
+	requiredJava := resolveRequiredJava(manifest, cfg.GameVersion)
+	if requiredJava > 0 {
+		javaPath := findInstalledJava(cfg.InstallDir, requiredJava)
+		if javaPath == "" && manifest != nil {
+			if _, err := ensureJava(ctx, client, srv, cfg.InstallDir, manifest, requiredJava); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func (l *Launcher) Launch(ctx context.Context, playerName string) error {
 	cfg, err := l.LoadConfig()
 	if err != nil {
@@ -280,7 +368,7 @@ func (l *Launcher) SyncMods(ctx context.Context, onProgress func(ProgressEvent))
 	if err != nil {
 		return err
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := newHTTPClient()
 	srv := &server.Client{BaseURL: serverCfg.ServerBaseURL, Secret: serverCfg.ServerSecret, Client: client}
 	slog.Info("launcher: sync mods start", "server", serverCfg.ServerBaseURL)
 	manifest, err := srv.FetchManifest(ctx)
@@ -447,9 +535,9 @@ func ensureJava(ctx context.Context, client *http.Client, srv *server.Client, ba
 		return "", err
 	}
 
-	ext := strings.ToLower(filepath.Ext(archiveName))
-	switch ext {
-	case ".zip":
+	archiveLower := strings.ToLower(archiveName)
+	switch {
+	case strings.HasSuffix(archiveLower, ".zip"):
 		targetDir := javaVersionDir(baseDir, required)
 		_ = os.RemoveAll(targetDir)
 		if err := os.MkdirAll(targetDir, 0o755); err != nil {
@@ -462,16 +550,21 @@ func ensureJava(ctx context.Context, client *http.Client, srv *server.Client, ba
 			return path, nil
 		}
 		return "", errors.New("java not found after extract: need Java " + strconv.Itoa(required))
-	case ".msi", ".exe":
-		if err := runJavaInstaller(ctx, dst); err != nil {
+	case strings.HasSuffix(archiveLower, ".tar.gz"), strings.HasSuffix(archiveLower, ".tgz"), strings.HasSuffix(archiveLower, ".tar"):
+		targetDir := javaVersionDir(baseDir, required)
+		_ = os.RemoveAll(targetDir)
+		if err := os.MkdirAll(targetDir, 0o755); err != nil {
 			return "", err
 		}
-		if path := findInstalledJava(baseDir, required); path != "" {
+		if err := archive.ExtractTar(dst, targetDir); err != nil {
+			return "", err
+		}
+		if path := findJavaInDirTree(targetDir, required); path != "" {
 			return path, nil
 		}
-		return "", errors.New("java installed but not found in local runtime: provide zip for Java " + strconv.Itoa(required))
+		return "", errors.New("java not found after extract: need Java " + strconv.Itoa(required))
 	default:
-		return "", errors.New("unsupported java package: " + ext)
+		return "", errors.New("unsupported java package: " + archiveLower + " (use zip or tar)")
 	}
 }
 
@@ -680,7 +773,15 @@ func cleanInstallDir(baseDir string) error {
 		return errors.New("install dir is empty")
 	}
 	
-	// Папки и файлы, которые нужно удалить
+	// Получаем абсолютный путь для безопасности
+	absBaseDir, err := filepath.Abs(baseDir)
+	if err != nil {
+		return fmt.Errorf("failed to get absolute path: %w", err)
+	}
+	baseDir = absBaseDir
+	
+	// Папки и файлы, которые нужно удалить (всё кроме java и файлов лаунчера)
+	// Файлы лаунчера (launcher.json, profile.json) хранятся в %APPDATA%/shinecore, не в InstallDir
 	itemsToRemove := []string{
 		"versions",
 		"libraries",
@@ -695,25 +796,38 @@ func cleanInstallDir(baseDir string) error {
 		"screenshots",
 		"options.txt",
 		"optionsof.txt",
+		"optionsshaders.txt",
 		"usercache.json",
 		"usernamecache.json",
+		"installers", // Временные установщики Forge/NeoForge
+		"tmp",        // Временные файлы установки
 	}
 	
 	javaDir := filepath.Join(baseDir, "java")
 	
+	// Удаляем все указанные папки и файлы
+	removedCount := 0
 	for _, item := range itemsToRemove {
 		path := filepath.Join(baseDir, item)
-		if err := os.RemoveAll(path); err != nil {
-			slog.Warn("launcher: failed to remove item", "path", path, "error", err)
+		if _, err := os.Stat(path); err == nil {
+			if err := os.RemoveAll(path); err != nil {
+				slog.Warn("launcher: failed to remove item", "path", path, "error", err)
+				// Продолжаем удаление остальных, но логируем ошибку
+			} else {
+				removedCount++
+			}
 		}
 	}
 	
-	// Убеждаемся, что папка java осталась
+	// Убеждаемся, что папка java осталась и не была удалена
 	if err := os.MkdirAll(javaDir, 0o755); err != nil {
-		return err
+		return fmt.Errorf("failed to preserve java dir: %w", err)
 	}
 	
-	slog.Info("launcher: install dir cleaned", "base_dir", baseDir)
+	slog.Info("launcher: install dir cleaned", 
+		"base_dir", baseDir, 
+		"removed_items", removedCount,
+		"preserved", "java, launcher files in %APPDATA%")
 	return nil
 }
 
@@ -841,4 +955,8 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func newHTTPClient() *http.Client {
+	return &http.Client{Timeout: 10 * time.Minute}
 }

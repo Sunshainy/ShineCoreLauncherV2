@@ -17,6 +17,8 @@ import (
 
 const (
 	metaBase = "https://meta.fabricmc.net"
+	// Резервные зеркала для Fabric API (fallback URLs)
+	metaMirrors = "https://maven.fabricmc.net"
 )
 
 func EnsureInstalled(ctx context.Context, baseDir, gameVersion, loaderVersion string, client *http.Client) (string, string, error) {
@@ -34,19 +36,45 @@ func EnsureInstalled(ctx context.Context, baseDir, gameVersion, loaderVersion st
 		loaderVersion = latest
 	}
 
-	profileURL := fmt.Sprintf("%s/v2/versions/loader/%s/%s/profile/json", metaBase, gameVersion, loaderVersion)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, profileURL, nil)
-	if err != nil {
-		return "", "", err
+	// Пытаемся загрузить профиль с основного сервера, при неудаче - с зеркала
+	profileURLs := []string{
+		fmt.Sprintf("%s/v2/versions/loader/%s/%s/profile/json", metaBase, gameVersion, loaderVersion),
+		fmt.Sprintf("%s/v2/versions/loader/%s/%s/profile/json", metaMirrors, gameVersion, loaderVersion),
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", err
+	
+	var resp *http.Response
+	var lastErr error
+	for _, url := range profileURLs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err = client.Do(req)
+		if err != nil {
+			lastErr = err
+			if resp != nil {
+				resp.Body.Close()
+			}
+			resp = nil
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			break // Успешно загрузили
+		}
+		status := resp.Status
+		resp.Body.Close()
+		resp = nil
+		lastErr = errors.New("fabric profile error: " + status)
+	}
+	
+	if resp == nil {
+		if lastErr != nil {
+			return "", "", fmt.Errorf("fabric profile download failed from all mirrors: %w", lastErr)
+		}
+		return "", "", errors.New("fabric profile download failed from all mirrors")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", errors.New("fabric profile error: " + resp.Status)
-	}
 	var meta mojang.VersionMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&meta); err != nil {
 		return "", "", err
@@ -72,19 +100,45 @@ func EnsureInstalled(ctx context.Context, baseDir, gameVersion, loaderVersion st
 }
 
 func fetchLatestLoader(ctx context.Context, client *http.Client) (string, error) {
-	url := metaBase + "/v2/versions/loader"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
+	// Пытаемся загрузить список версий с основного сервера, при неудаче - с зеркала
+	urls := []string{
+		metaBase + "/v2/versions/loader",
+		metaMirrors + "/v2/versions/loader",
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
+	
+	var resp *http.Response
+	var lastErr error
+	for _, url := range urls {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp, err = client.Do(req)
+		if err != nil {
+			lastErr = err
+			if resp != nil {
+				resp.Body.Close()
+			}
+			resp = nil
+			continue
+		}
+		if resp.StatusCode == http.StatusOK {
+			break // Успешно загрузили
+		}
+		status := resp.Status
+		resp.Body.Close()
+		resp = nil
+		lastErr = errors.New("fabric loader list error: " + status)
+	}
+	
+	if resp == nil {
+		if lastErr != nil {
+			return "", fmt.Errorf("fabric loader list download failed from all mirrors: %w", lastErr)
+		}
+		return "", errors.New("fabric loader list download failed from all mirrors")
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", errors.New("fabric loader list failed: " + resp.Status)
-	}
 	var versions []struct {
 		Version string `json:"version"`
 		Stable  bool   `json:"stable"`

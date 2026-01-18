@@ -156,8 +156,7 @@ func (a *App) LaunchGame(params LaunchParams) error {
 		_ = a.OpenConsoleWindow()
 	}
 	{
-		syncCtx, cancel := context.WithTimeout(a.ctx, 30*time.Second)
-		err := a.launcher.SyncMods(syncCtx, func(evt launcher.ProgressEvent) {
+		err := a.prepareForLaunch(func(evt launcher.ProgressEvent) {
 			if a.ctx == nil {
 				return
 			}
@@ -169,7 +168,6 @@ func (a *App) LaunchGame(params LaunchParams) error {
 			}
 			runtime.EventsEmit(a.ctx, "sync:progress", payload)
 		})
-		cancel()
 		if err != nil {
 			runtime.EventsEmit(a.ctx, "sync:error", err.Error())
 			return err
@@ -307,6 +305,13 @@ func (a *App) InstallGame() error {
 	}
 	runtime.EventsEmit(a.ctx, "install:complete")
 	return nil
+}
+
+func (a *App) prepareForLaunch(onProgress func(launcher.ProgressEvent)) error {
+	if a.ctx == nil {
+		return errors.New("app not ready")
+	}
+	return a.launcher.PrepareForLaunch(a.ctx, onProgress)
 }
 
 func (a *App) OpenGameDirectory() {

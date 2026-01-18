@@ -25,45 +25,15 @@ type Client struct {
 }
 
 func (c *Client) FetchManifest(ctx context.Context) (*Manifest, error) {
-	base := strings.TrimRight(c.BaseURL, "/")
-	req, err := c.SignedRequest(ctx, http.MethodGet, base+"/manifest")
-	if err != nil {
-		return c.loadCachedManifest()
+	manifest, raw, err := c.fetchManifestOnline(ctx)
+	if err == nil && manifest != nil {
+		_ = c.saveCachedManifest(raw)
+		return manifest, nil
 	}
-	resp, err := c.httpClient().Do(req)
-	if err != nil {
-		// Пытаемся загрузить из кэша при ошибке подключения
-		if cached, cacheErr := c.loadCachedManifest(); cacheErr == nil {
-			return cached, nil
-		}
-		return nil, err
+	if cached, cacheErr := c.loadCachedManifest(); cacheErr == nil {
+		return cached, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		// Пытаемся загрузить из кэша при ошибке сервера
-		if cached, cacheErr := c.loadCachedManifest(); cacheErr == nil {
-			// Кэш загружен успешно - возвращаем без ошибки
-			return cached, nil
-		}
-		// Кэш недоступен - возвращаем ошибку (будет использован fallback на конфиг в launcher.go)
-		return nil, errors.New("manifest unavailable: server error " + resp.Status)
-	}
-	
-	// Читаем ответ
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return c.loadCachedManifest()
-	}
-	
-	var manifest Manifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
-		return c.loadCachedManifest()
-	}
-	
-	// Сохраняем манифест в кэш при успешной загрузке
-	_ = c.saveCachedManifest(body)
-	
-	return &manifest, nil
+	return nil, err
 }
 
 func (c *Client) manifestCachePath() (string, error) {
@@ -79,11 +49,23 @@ func (c *Client) manifestCachePath() (string, error) {
 }
 
 func (c *Client) saveCachedManifest(data []byte) error {
-	path, err := c.manifestCachePath()
+	manifestPath, err := c.manifestCachePath()
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o644)
+	metaPath, err := c.manifestCacheMetaPath()
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(manifestPath, data, 0o644); err != nil {
+		return err
+	}
+	meta := cacheMeta{FetchedAtUnix: time.Now().Unix()}
+	payload, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(metaPath, payload, 0o644)
 }
 
 func (c *Client) loadCachedManifest() (*Manifest, error) {
@@ -100,6 +82,89 @@ func (c *Client) loadCachedManifest() (*Manifest, error) {
 		return nil, err
 	}
 	return &manifest, nil
+}
+
+func (c *Client) fetchManifestOnline(ctx context.Context) (*Manifest, []byte, error) {
+	base := strings.TrimRight(c.BaseURL, "/")
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	client := c.httpClient()
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if reqCtx.Err() != nil {
+			return nil, nil, reqCtx.Err()
+		}
+		req, err := c.SignedRequest(reqCtx, http.MethodGet, base+"/manifest")
+		if err != nil {
+			return nil, nil, err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			sleepWithContext(reqCtx, time.Duration(attempt)*300*time.Millisecond)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+				return nil, nil, errors.New("manifest unavailable: server error " + resp.Status)
+			}
+			lastErr = errors.New("manifest unavailable: server error " + resp.Status)
+			sleepWithContext(reqCtx, time.Duration(attempt)*300*time.Millisecond)
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			sleepWithContext(reqCtx, time.Duration(attempt)*300*time.Millisecond)
+			continue
+		}
+		var manifest Manifest
+		if err := json.Unmarshal(body, &manifest); err != nil {
+			return nil, nil, err
+		}
+		return &manifest, body, nil
+	}
+	return nil, nil, lastErr
+}
+
+type cacheMeta struct {
+	FetchedAtUnix int64 `json:"fetched_at_unix"`
+}
+
+func (c *Client) manifestCacheMetaPath() (string, error) {
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", err
+	}
+	cacheDir := filepath.Join(configDir, "shinecore")
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return "", err
+	}
+	return filepath.Join(cacheDir, "manifest_cache.meta.json"), nil
+}
+
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	_ = os.Remove(path)
+	return os.Rename(tmp, path)
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
 }
 
 func (c *Client) SignedRequest(ctx context.Context, method, urlStr string) (*http.Request, error) {

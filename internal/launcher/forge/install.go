@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -47,13 +48,30 @@ func EnsureInstalled(ctx context.Context, req InstallRequest) (string, error) {
 		client = http.DefaultClient
 	}
 
-	installerURL := installerURL(req.LoaderKind, req.LoaderVersion)
-	if installerURL == "" {
+	installerURLs := installerURLs(req.LoaderKind, req.LoaderVersion)
+	if len(installerURLs) == 0 {
 		return "", errors.New("unsupported loader")
 	}
 	installerPath := filepath.Join(req.BaseDir, "installers", string(req.LoaderKind)+"-"+req.LoaderVersion+"-installer.jar")
-	if err := download.EnsureFile(ctx, client, installerURL, installerPath, 0, "", nil); err != nil {
-		return "", err
+	
+	// Пытаемся загрузить установщик с основного URL, при неудаче - с резервных зеркал
+	var lastErr error
+	for i, url := range installerURLs {
+		err := download.EnsureFile(ctx, client, url, installerPath, 0, "", nil)
+		if err == nil {
+			if i > 0 {
+				log.Printf("forge: installer downloaded from fallback mirror %d/%d", i+1, len(installerURLs))
+			}
+			break // Успешно загрузили
+		}
+		lastErr = err
+		if i < len(installerURLs)-1 {
+			log.Printf("forge: installer download failed from mirror %d/%d, trying next...", i+1, len(installerURLs))
+		}
+	}
+	
+	if lastErr != nil {
+		return "", fmt.Errorf("forge installer download failed from all mirrors: %w", lastErr)
 	}
 
 	// Ensure base game.
@@ -123,6 +141,30 @@ func installerURL(kind LoaderKind, version string) string {
 		return fmt.Sprintf("https://maven.neoforged.net/releases/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", version, version)
 	default:
 		return ""
+	}
+}
+
+// installerURLs возвращает список URL для загрузчика с резервными зеркалами
+func installerURLs(kind LoaderKind, version string) []string {
+	switch kind {
+	case LoaderForge:
+		return []string{
+			// Основной официальный Maven репозиторий
+			fmt.Sprintf("https://maven.minecraftforge.net/net/minecraftforge/forge/%s/forge-%s-installer.jar", version, version),
+			// Официальное зеркало files.minecraftforge.net
+			fmt.Sprintf("https://files.minecraftforge.net/maven/net/minecraftforge/forge/%s/forge-%s-installer.jar", version, version),
+			// FastMinecraftMirror - быстрое зеркало
+			fmt.Sprintf("https://forge.fastmcmirror.org/net/minecraftforge/forge/%s/forge-%s-installer.jar", version, version),
+		}
+	case LoaderNeoForge:
+		return []string{
+			// Основной официальный репозиторий (releases)
+			fmt.Sprintf("https://maven.neoforged.net/releases/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", version, version),
+			// Альтернативный путь (без releases)
+			fmt.Sprintf("https://maven.neoforged.net/net/neoforged/neoforge/%s/neoforge-%s-installer.jar", version, version),
+		}
+	default:
+		return []string{}
 	}
 }
 
